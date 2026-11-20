@@ -1,132 +1,285 @@
+// ============================================================
+// ESP8266 Watchdog: контроль интернета с веб-настройкой
+// Версия: v1.2
+// ------------------------------------------------------------
+// ИСТОРИЯ ВЕРСИЙ:
+// v1.2 - Время удержания реле при потере Wi-Fi увеличено до 5 секунд
+//        (теперь совпадает с временем при потере интернета).
+// v1.1 - Добавлен принудительный запуск портала при старте (3 минуты).
+//        Профилактическая перезагрузка теперь привязана ко времени
+//        (20 дней с момента включения), а не к количеству пингов.
+// v1.0 - Базовая версия: WiFiManager, EEPROM, проверка ping, реле.
+// ------------------------------------------------------------
+// • При включении ВСЕГДА создаёт точку доступа "ESP_watchdog" на 3 минуты.
+// • В это время можно зайти на 192.168.4.1 и изменить настройки.
+//
+// ⚠️ ВАЖНОЕ ПРИМЕЧАНИЕ ПО БРАУЗЕРАМ:
+// Для входа на страницу настроек (192.168.4.1) с телефона 
+// ИСПОЛЬЗУЙТЕ ЯНДЕКС БРАУЗЕР или FIREFOX. 
+// Стандартные Chrome и Samsung Internet блокируют локальные 
+// HTTP-запросы и могут выдавать ошибку "Сайт недоступен".
+//
+// • Если за 3 минуты пользователь ничего не сохранил, портал 
+//   закрывается, и ESP подключается к ранее сохранённой сети Wi-Fi.
+// • В рабочем режиме периодически проверяет доступность PING_HOST.
+//   При FAIL_LIMIT неудачах подряд включает реле и перезагружается.
+// • Профилактическая перезагрузка выполняется ровно через 20 дней
+//   НЕПРЕРЫВНОЙ РАБОТЫ (с момента включения платы), независимо от 
+//   того, были ли пинги успешными или нет.
+// ============================================================
+
 #include <ESP8266WiFi.h>
+#include <WiFiManager.h>
+#include <EEPROM.h>
 
 #ifndef LED_BUILTIN
-#define LED_BUILTIN 2  // Встроенный светодиод на ESP8266 (обычно GPIO2)
+#define LED_BUILTIN 2   // Встроенный светодиод на ESP8266 (обычно GPIO2)
 #endif
 
-// Настройки WiFi
-const char* ssid = "A";
-const char* password = "s";
+// ---------- Карта EEPROM ----------
+// В EEPROM храним только три пользовательских параметра.
+// Флаг 0xAA в байте 48 означает, что данные уже записаны.
+// SSID/пароль Wi-Fi хранит сам WiFiManager (в отдельной области Flash).
+#define EEPROM_SIZE       512
+#define ADDR_RESENDTIME   0    // unsigned long (4 байта) — период ping, мс
+#define ADDR_FAIL_LIMIT   4    // int (4 байта)           — FAIL_LIMIT
+#define ADDR_PING_HOST    8    // char[40]                — PING_HOST
+#define ADDR_INIT_FLAG    48   // 1 байт: 0xAA = данные записаны
 
-// Настройки проверки интернета
-#define PING_HOST "8.8.8.8"     // Хост для проверки (Google DNS)
+// ---------- Значения по умолчанию ----------
+const unsigned long DEFAULT_RESENDTIME = 15UL * 60 * 1000; // 15 минут
+const int DEFAULT_FAIL_LIMIT = 10;                         // 10 неудач подряд
+const char* DEFAULT_PING_HOST = "8.8.8.8";                 // Google DNS
 
-// Настройки реле
-#define RELAY_PIN 4      // Пин для управления реле (GPIO4)
-#define FAIL_LIMIT 10    // Количество неудачных проверок для сработки реле сработет через 2 часа после порпадания инетрнета
-#define RESTART_DELAY 5000 // Задержка перед перезагрузкой (5 секунд)
-#define FIRST_DELAY 3 // Задержка перед подключением к вайфай в минутах [ (1 минута)
+// ---------- Текущие настройки ----------
+unsigned long resendtime = DEFAULT_RESENDTIME;  // период проверки, мс
+int FAIL_LIMIT = DEFAULT_FAIL_LIMIT;            // порог неудач для реле
+char pingHost[40] = "8.8.8.8";                  // что пингуем
 
+// ---------- Пины и тайминги железа ----------
+#define RELAY_PIN             4        // GPIO4 — управление реле
+#define RESTART_DELAY         5000     // 5 секунд: время, на которое реле снимает питание
+#define WIFI_CONNECT_TIMEOUT  180000   // 3 минуты — таймаут подключения/переподключения, мс
+#define WIFI_CHECK_INTERVAL   500      // шаг опроса статуса Wi-Fi, мс
 
-// Настройки счётчика успешных пингов
-#define SUCCESS_LIMIT 2400 // Количество успешных проверок для перезагрузки самой ESP. примерно ресарт ESP раз в 25 дней.
+// ---------- Профилактическая перезагрузка ----------
+// Считается от момента включения (bootTime). 
+// 20 дней * 24 часа * 60 минут * 60 секунд * 1000 мс = 1 728 000 000 мс.
+// Примечание: millis() переполняется через ~49.7 дней, поэтому 20 дней — безопасное значение.
+#define PREVENTIVE_RESTART_DAYS 20
+const unsigned long PREVENTIVE_RESTART_MS = PREVENTIVE_RESTART_DAYS * 24UL * 60UL * 60UL * 1000UL;
 
-// Настройки подключения к WiFi
-#define WIFI_CONNECT_TIMEOUT 180000 // 3 минуты (в миллисекундах). Время на успешное подключение. если не подключится, рестарт роутера
-#define WIFI_CHECK_INTERVAL 500     // Интервал проверки подключения (500 мс)
+// ---------- Таймаут портала настройки ----------
+#define CONFIG_PORTAL_TIMEOUT 180      // 3 минуты (180 секунд)
 
-// Таймеры
-unsigned long now = 0;
-unsigned long lastMeasure = 0;
-const unsigned long resendtime = 15UL * 60 * 1000; // 15 минут между проверками
+// ---------- Переменные состояния ----------
+unsigned long now = 0;             // текущее millis()
+unsigned long lastMeasure = 0;     // момент последней проверки ping
+unsigned long bootTime = 0;        // момент старта (для профилактической перезагрузки)
+int failCount = 0;                 // неудач подряд
+int successCount = 0;              // успехов подряд (ТОЛЬКО для логов, не влияет на рестарт)
+bool relayState = false;           // текущее состояние реле (для отладки)
+bool shouldSaveConfig = false;     // выставляется в callback при нажатии "Save"
 
-// Счетчики
-int failCount = 0;        // Счетчик неудачных проверок
-int successCount = 0;     // Счетчик успешных проверок
-bool relayState = false;  // Текущее состояние реле (false - выключено, true - включено)
+// ---------- Прототипы ----------
+void loadConfig();
+void saveConfig();
+void saveConfigCallback();
+void applyAndSave(WiFiManagerParameter &pResend, WiFiManagerParameter &pFail, WiFiManagerParameter &pHost);
+bool checkInternet();
+void restartESP();
 
+// ============================================================
+// Загрузка настроек из EEPROM
+// ============================================================
+void loadConfig() {
+  EEPROM.begin(EEPROM_SIZE);
+  if (EEPROM.read(ADDR_INIT_FLAG) == 0xAA) {
+    EEPROM.get(ADDR_RESENDTIME, resendtime);
+    EEPROM.get(ADDR_FAIL_LIMIT, FAIL_LIMIT);
+    for (int i = 0; i < 40; i++) {
+      pingHost[i] = EEPROM.read(ADDR_PING_HOST + i);
+    }
+    pingHost[39] = '\0';   // гарантируем нуль-терминатор
+  }
+  EEPROM.end();
+
+  Serial.println("Config loaded:");
+  Serial.print("  resendtime (min): "); Serial.println(resendtime / 60000);
+  Serial.print("  FAIL_LIMIT: ");       Serial.println(FAIL_LIMIT);
+  Serial.print("  PING_HOST: ");        Serial.println(pingHost);
+}
+
+// ============================================================
+// Сохранение настроек в EEPROM
+// ============================================================
+void saveConfig() {
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.put(ADDR_RESENDTIME, resendtime);
+  EEPROM.put(ADDR_FAIL_LIMIT, FAIL_LIMIT);
+  for (int i = 0; i < 40; i++) {
+    EEPROM.write(ADDR_PING_HOST + i, (i < strlen(pingHost)) ? pingHost[i] : 0);
+  }
+  EEPROM.write(ADDR_INIT_FLAG, 0xAA);
+  EEPROM.commit();
+  EEPROM.end();
+
+  Serial.println("Config saved to EEPROM");
+}
+
+// ============================================================
+// Callback WiFiManager: пользователь нажал "Save"
+// ============================================================
+void saveConfigCallback() {
+  shouldSaveConfig = true;
+}
+
+// ============================================================
+// Применить значения из полей веб-формы и сохранить в EEPROM
+// ============================================================
+void applyAndSave(WiFiManagerParameter &pResend, WiFiManagerParameter &pFail, WiFiManagerParameter &pHost) {
+  unsigned long newResend = atol(pResend.getValue()) * 60000UL;   // мин → мс
+  int newFail = atoi(pFail.getValue());
+  const char* newHost = pHost.getValue();
+
+  if (newResend > 0)  resendtime = newResend;
+  if (newFail > 0)    FAIL_LIMIT = newFail;
+  if (strlen(newHost) > 0) {
+    strncpy(pingHost, newHost, 39);
+    pingHost[39] = '\0';
+  }
+
+  saveConfig();
+
+  Serial.println("Settings applied and saved:");
+  Serial.print("  resendtime (min): "); Serial.println(resendtime / 60000);
+  Serial.print("  FAIL_LIMIT: ");       Serial.println(FAIL_LIMIT);
+  Serial.print("  PING_HOST: ");        Serial.println(pingHost);
+}
+
+// ============================================================
+// Setup
+// ============================================================
 void setup() {
   Serial.begin(9600);
   delay(100);
-
   Serial.println();
   Serial.println("========================================");
-  Serial.println("ESP8266 STARTUP");
+  Serial.println("ESP8266 STARTUP (v1.2)");
   Serial.println("========================================");
 
-  // Настройка пинов
+  // Пины: LED и реле выключены (активный уровень реле — LOW)
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, HIGH);  // Выключаем светодиод
-  digitalWrite(RELAY_PIN, HIGH);     // Реле выключено
-    Serial.print("Waiting for ");
-  Serial.print(FIRST_DELAY);
-    Serial.println(" minutes");
-  
-  delay(FIRST_DELAY * 60000);
-  setup_wifi();
-}
+  digitalWrite(LED_BUILTIN, HIGH);
+  digitalWrite(RELAY_PIN, HIGH);
 
-void setup_wifi() {
-  Serial.println();
-  Serial.println("Starting..");
-  delay(300);
-  Serial.print("Connecting to Wifi ");
-  Serial.println(ssid);
+  // 1. Запоминаем момент старта для профилактической перезагрузки
+  bootTime = millis();
 
-  WiFi.begin(ssid, password);
+  // 2. Читаем сохранённые настройки (или значения по умолчанию)
+  loadConfig();
 
-  unsigned long startAttemptTime = millis();
-  int attempts = 0;
+  // 3. Настраиваем WiFiManager
+  WiFiManager wifiManager;
+  wifiManager.setSaveConfigCallback(saveConfigCallback);
+  wifiManager.setConfigPortalTimeout(CONFIG_PORTAL_TIMEOUT);
 
-  // Пытаемся подключиться к WiFi в течение заданного времени
-  while (WiFi.status() != WL_CONNECTED) {
-    // Проверяем, не истекло ли время ожидания
-    if (millis() - startAttemptTime > WIFI_CONNECT_TIMEOUT) {
-      Serial.println();
-      Serial.println("========================================");
-      Serial.println("!!! WIFI CONNECTION TIMEOUT !!!");
-      Serial.println("Cannot connect to WiFi within 3 minutes!");
-      Serial.println("========================================");
+  // Готовим строковые представления текущих значений для полей формы
+  char resendtimeStr[16];
+  snprintf(resendtimeStr, sizeof(resendtimeStr), "%lu", resendtime / 60000UL);
+  char failLimitStr[8];
+  snprintf(failLimitStr, sizeof(failLimitStr), "%d", FAIL_LIMIT);
 
-      // Включаем реле
-      digitalWrite(RELAY_PIN, LOW);
-      relayState = true;
-      Serial.println("!!! RELAY TRIGGERED !!!");
+  // Три пользовательских поля на веб-странице
+  WiFiManagerParameter paramResend("resend_min", "Период отправки ping (мин)", resendtimeStr, 16);
+  WiFiManagerParameter paramFail("fail_limit", "Количество неудачных ping для перезагрузки", failLimitStr, 8);
+  WiFiManagerParameter paramHost("ping_host", "Что пингуем", pingHost, 40);
 
-      delay(5000);
+  wifiManager.addParameter(&paramResend);
+  wifiManager.addParameter(&paramFail);
+  wifiManager.addParameter(&paramHost);
 
-      // Перезагружаем плату
-      Serial.println("Restarting ESP8266...");
-      delay(500);
+  // 4. ПРИНУДИТЕЛЬНО запускаем точку доступа на 3 минуты при каждом включении
+  Serial.println("Starting Config Portal. Connect to AP 'ESP_watchdog'...");
+  bool connected = wifiManager.startConfigPortal("ESP_watchdog");
+
+  // 5. Обработка результата после закрытия портала
+  if (shouldSaveConfig) {
+    // Пользователь нажал "Save" — применяем и сохраняем, затем перезагрузка
+    Serial.println("User pressed Save. Applying settings...");
+    applyAndSave(paramResend, paramFail, paramHost);
+    Serial.println("Restarting to apply settings...");
+    delay(1000);
+    ESP.restart();
+  } else if (!connected) {
+    // Портал закрылся по таймауту 3 минут (пользователь ничего не нажал)
+    Serial.println("Portal timeout. Attempting to connect to saved Wi-Fi...");
+    
+    String savedSSID = wifiManager.getWiFiSSID();
+    String savedPass = wifiManager.getWiFiPass();
+
+    if (savedSSID.length() > 0) {
+      WiFi.begin(savedSSID.c_str(), savedPass.c_str());
+      
+      unsigned long startAttempt = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 15000) {
+        delay(500);
+        Serial.print(".");
+      }
+
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nConnected to saved Wi-Fi!");
+      } else {
+        Serial.println("\nFailed to connect to saved Wi-Fi! Restarting...");
+        ESP.restart();
+      }
+    } else {
+      Serial.println("No saved Wi-Fi found. Restarting...");
       ESP.restart();
-      return; // Код дальше не выполнится, но для безопасности
     }
-
-    delay(WIFI_CHECK_INTERVAL);
-    Serial.print(".");
-    attempts++;
-
-    // Каждые 10 секунд выводим статус
-    if (attempts % 20 == 0) {
-      Serial.print(" [");
-      Serial.print((millis() - startAttemptTime) / 1000);
-      Serial.print("s] ");
-    }
+  } else {
+    // Подключились (если портал закрылся по другой причине)
+    Serial.println("Connected to WiFi.");
   }
 
-  // Если подключились успешно
+  // 6. Дальше — обычная работа
   Serial.println();
   Serial.println("Connected to Wifi");
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
-  Serial.print("Connection time: ");
-  Serial.print((millis() - startAttemptTime) / 1000);
-  Serial.println(" seconds");
+  Serial.print("PING_HOST: ");        Serial.println(pingHost);
+  Serial.print("resendtime (min): "); Serial.println(resendtime / 60000);
+  Serial.print("FAIL_LIMIT: ");       Serial.println(FAIL_LIMIT);
+  Serial.print("Preventive restart in "); Serial.print(PREVENTIVE_RESTART_DAYS); Serial.println(" days.");
+
+  // 7. Сброс таймера пинга
+  lastMeasure = millis();
 }
 
-// Функция проверки интернета через соединение с DNS
+// ============================================================
+// Проверка интернета
+// ============================================================
 bool checkInternet() {
   WiFiClient client;
-  // Пытаемся подключиться к Google DNS (порт 53)
-  if (client.connect(IPAddress(8, 8, 8, 8), 53)) {
+  client.setTimeout(2000); // Меньше watchdog ESP8266 (~3 с)
+
+  IPAddress ip;
+  if (!ip.fromString(pingHost)) {
+    // Если хост не IP — пробуем разрешить как доменное имя
+    if (!WiFi.hostByName(pingHost, ip)) return false;
+  }
+
+  if (client.connect(ip, 53)) {
     client.stop();
     return true;
   }
   return false;
 }
 
-// Функция перезагрузки ESP8266
+// ============================================================
+// Перезагрузка ESP8266
+// ============================================================
 void restartESP() {
   Serial.println("========================================");
   Serial.println("!!! RESTARTING ESP8266 !!!");
@@ -135,119 +288,103 @@ void restartESP() {
   ESP.restart();
 }
 
+// ============================================================
+// Основной цикл
+// ============================================================
 void loop() {
   now = millis();
 
-  // Проверяем подключение к WiFi
+  // ---------- Проверка профилактической перезагрузки ----------
+  // Выполняется ПЕРВОЙ, независимо от Wi-Fi и пингов.
+  // Считается от bootTime (момента включения), не сбрасывается при сбоях.
+  if (millis() - bootTime >= PREVENTIVE_RESTART_MS) {
+    Serial.println("!!! PREVENTIVE RESTART (20 DAYS UPTIME) !!!");
+    delay(1000);
+    restartESP();
+    return;
+  }
+
+  // ---------- Контроль Wi-Fi ----------
+  // Если Wi-Fi отвалился — пытаемся переподключиться с таймаутом.
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi disconnected! Reconnecting...");
-
-    // Пытаемся переподключиться с таймаутом
     unsigned long startReconnectTime = millis();
-    WiFi.begin(ssid, password);
+    WiFi.begin();   // использует сохранённые WiFiManager SSID/пароль
 
     while (WiFi.status() != WL_CONNECTED) {
-      // Проверяем таймаут переподключения
-      if (millis() - startReconnectTime > WIFI_CONNECT_TIMEOUT) {
-        Serial.println();
-        Serial.println("========================================");
-        Serial.println("!!! WIFI RECONNECTION TIMEOUT !!!");
-        Serial.println("Cannot reconnect to WiFi within 3 minutes!");
-        Serial.println("========================================");
-
-        // Включаем реле
-        digitalWrite(RELAY_PIN, LOW);
-        relayState = true;
-        Serial.println("!!! RELAY TRIGGERED !!!");
-
+      // Проверяем профилактический таймер даже внутри цикла ожидания Wi-Fi,
+      // так как этот цикл блокирует основной loop().
+      if (millis() - bootTime >= PREVENTIVE_RESTART_MS) {
+        Serial.println("!!! PREVENTIVE RESTART (20 DAYS UPTIME) !!!");
         delay(1000);
-
-        // Перезагружаем плату
-        Serial.println("Restarting ESP8266...");
-        delay(500);
-        ESP.restart();
+        restartESP();
         return;
       }
 
+      if (millis() - startReconnectTime > WIFI_CONNECT_TIMEOUT) {
+        Serial.println("!!! WIFI RECONNECTION TIMEOUT !!!");
+        
+        // ВНИМАНИЕ: теперь импульс реле длится 5 секунд (RESTART_DELAY)
+        digitalWrite(RELAY_PIN, LOW);
+        relayState = true;
+        delay(RESTART_DELAY); 
+        
+        ESP.restart();
+        return;
+      }
       delay(WIFI_CHECK_INTERVAL);
       Serial.print(".");
     }
 
-    // Если переподключились успешно
     Serial.println();
-    Serial.println("Reconnected to Wifi");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
+    Serial.println("Reconnected");
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
 
-    // Сбрасываем счетчики при переподключении
     failCount = 0;
     successCount = 0;
+    lastMeasure = millis();   // сброс таймера, чтобы первый ping после
+                              // переподключения был через resendtime
     return;
   }
 
-  // Основной цикл проверки интернета
+  // ---------- Периодическая проверка интернета ----------
   if (now - lastMeasure > resendtime) {
-    lastMeasure = now;
-
-    // Проверяем интернет
-    Serial.print("Checking internet connection... ");
+    lastMeasure = now;   // отсчёт следующего интервала — с момента запуска проверки
+    Serial.print("Checking internet... ");
     bool success = checkInternet();
 
     if (success) {
+      // ----- Успех -----
       Serial.println("OK");
-
       digitalWrite(LED_BUILTIN, LOW);
       delay(200);
       digitalWrite(LED_BUILTIN, HIGH);
 
-      // УДАЧНАЯ ПРОВЕРКА - обнуляем счетчик неудач и увеличиваем счетчик успехов
       failCount = 0;
-      successCount++;
+      successCount++; // Счетчик успехов теперь нужен только для логов
 
-      Serial.print("Fail count reset to: 0");
-      Serial.print(" | Success count: ");
-      Serial.print(successCount);
-      Serial.print(" / ");
-      Serial.println(SUCCESS_LIMIT);
-
-      // Проверяем, не достигнут ли лимит успешных проверок
-      if (successCount >= SUCCESS_LIMIT) {
-        Serial.println("!!! SUCCESS LIMIT REACHED !!! Restarting ESP8266...");
-        delay(1000);
-        restartESP();
-      }
-
+      Serial.print("Success count: "); Serial.println(successCount);
     } else {
+      // ----- Неудача -----
       Serial.println("Error!");
       digitalWrite(LED_BUILTIN, HIGH);
 
-      // НЕУДАЧНАЯ ПРОВЕРКА - увеличиваем счетчик неудач и обнуляем счетчик успехов
       failCount++;
-      successCount = 0;  // Обнуляем счетчик успехов при любой ошибке
+      successCount = 0; // Обнуляем счетчик успехов (для логов)
 
-      Serial.print("Fail count: ");
-      Serial.print(failCount);
-      Serial.print(" / ");
-      Serial.print(FAIL_LIMIT);
-      Serial.print(" | Success count reset to: 0");
-      Serial.println();
+      Serial.print("Fail count: "); Serial.print(failCount);
+      Serial.print(" / ");          Serial.println(FAIL_LIMIT);
 
-      // Проверяем, не превышен ли лимит неудач
+      // Порог неудач — включаем реле и перезагружаемся.
+      // ВНИМАНИЕ: здесь импульс реле длится 5 секунд (RESTART_DELAY).
       if (failCount >= FAIL_LIMIT) {
-        // Включаем реле
         digitalWrite(RELAY_PIN, LOW);
         relayState = true;
-        Serial.println("!!! RELAY TRIGGERED !!! Fail limit exceeded!");
-
-        Serial.print("Waiting ");
-        Serial.print(RESTART_DELAY / 1000);
-        Serial.println(" seconds before restart...");
-
+        Serial.println("!!! RELAY TRIGGERED !!!");
         delay(RESTART_DELAY);
         restartESP();
       }
     }
-
     Serial.println("---");
   }
 }
