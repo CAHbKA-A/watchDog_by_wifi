@@ -48,7 +48,7 @@
 
 // ---------- Значения по умолчанию ----------
 const unsigned long DEFAULT_RESENDTIME = 15UL * 60 * 1000; // 15 минут
-const int DEFAULT_FAIL_LIMIT = 10;                         // 10 неудач подряд
+const int DEFAULT_FAIL_LIMIT = 3;                         // 3 неудач подряд
 const char* DEFAULT_PING_HOST = "8.8.8.8";                 // Google DNS
 
 // ---------- Текущие настройки ----------
